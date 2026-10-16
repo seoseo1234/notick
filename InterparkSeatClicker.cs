@@ -48,7 +48,8 @@ namespace InterparkNativeClicker
     internal static class SeatDetector
     {
         public static double? NumberAxisAngle { get; private set; }
-        public static void ResetNumberAxis() { NumberAxisAngle = null; }
+        public static bool NumberAxisChanged { get; private set; }
+        public static void ResetNumberAxis() { NumberAxisAngle = null; NumberAxisChanged = false; }
         private static readonly int[][] PriorityColors = new int[][] {
             new[]{117,87,243}, new[]{8,169,30}, new[]{3,181,233}, new[]{255,114,72},
             new[]{139,206,52}, new[]{148,0,0}, new[]{255,204,16}, new[]{255,38,147},
@@ -58,7 +59,7 @@ namespace InterparkNativeClicker
             new[]{161,253,251}, new[]{68,132,183}
         };
 
-        public static List<SeatDot> Scan(Bitmap bitmap)
+        public static List<SeatDot> Scan(Bitmap bitmap, bool refreshNumberAxis, bool fastEmptyExit)
         {
             int width = bitmap.Width, height = bitmap.Height;
             var rect = new Rectangle(0, 0, width, height);
@@ -67,10 +68,22 @@ namespace InterparkNativeClicker
             byte[] bytes = new byte[stride * height];
             Marshal.Copy(data.Scan0, bytes, 0, bytes.Length);
             bitmap.UnlockBits(data);
-            if (!NumberAxisAngle.HasValue) NumberAxisAngle = DetectNumberAxis(bytes, width, height, stride);
+            NumberAxisChanged = false;
+            // Number-label analysis is the most expensive part of a scan. Run it
+            // immediately after map movement and then only periodically; colored-seat
+            // detection below still runs on every frame at full speed.
+            if (refreshNumberAxis || !NumberAxisAngle.HasValue)
+            {
+                double? detectedNumberAxis = DetectNumberAxis(bytes, width, height, stride);
+                if (detectedNumberAxis.HasValue)
+                {
+                    NumberAxisChanged = NumberAxisAngle.HasValue &&
+                        AxisDistance(NumberAxisAngle.Value, detectedNumberAxis.Value) > Math.PI / 24;
+                    NumberAxisAngle = detectedNumberAxis;
+                }
+            }
 
             int size = width * height;
-            var mask = new byte[size];
             var colored = new byte[size];
             for (int y = 0; y < height; y++)
             {
@@ -83,18 +96,35 @@ namespace InterparkNativeClicker
                     int hi = Math.Max(r, Math.Max(g, b));
                     int lo = Math.Min(r, Math.Min(g, b));
                     int chroma = hi - lo;
-                    bool isColor = chroma >= 42;
-                    // Seat maps use pale gray dots for unavailable seats. They help us
-                    // infer rows/aisles, but only colored dots may be clicked.
-                    bool isGrayDot = chroma <= 25 && hi >= 180 && hi <= 248;
-                    if (isColor || isGrayDot) mask[index] = 1;
-                    if (isColor) colored[index] = 1;
+                    if (chroma >= 42) colored[index] = 1;
                 }
             }
 
-            var result = new List<SeatDot>();
             var seen = new byte[size];
             var queue = new int[size];
+            if (fastEmptyExit && !HasSeatLikeColorComponent(colored, width, height, seen, queue))
+                return new List<SeatDot>();
+
+            // Only build and traverse the much larger gray-seat mask after the fast
+            // color pass has found a plausible available seat.
+            var mask = new byte[size];
+            for (int y = 0; y < height; y++)
+            {
+                int row = y * stride;
+                int index = y * width;
+                for (int x = 0; x < width; x++, index++)
+                {
+                    if (colored[index] != 0) { mask[index] = 1; continue; }
+                    int p = row + x * 3;
+                    int b = bytes[p], g = bytes[p + 1], r = bytes[p + 2];
+                    int hi = Math.Max(r, Math.Max(g, b));
+                    int lo = Math.Min(r, Math.Min(g, b));
+                    if (hi - lo <= 25 && hi >= 180 && hi <= 248) mask[index] = 1;
+                }
+            }
+
+            Array.Clear(seen, 0, seen.Length);
+            var result = new List<SeatDot>();
             for (int start = 0; start < size; start++)
             {
                 if (mask[start] == 0 || seen[start] != 0) continue;
@@ -130,8 +160,12 @@ namespace InterparkNativeClicker
                 if (w < 5 || h < 5 || w > 90 || h > 90) continue;
                 double ratio = (double)w / h;
                 if (ratio < 0.68 || ratio > 1.47) continue;
-                if (pixels < Math.Max(8, (int)(w * h * 0.07)) || pixels > w * h * 0.96) continue;
-                bool available = colorPixels >= Math.Max(4, (int)(pixels * 0.035));
+                int boxArea = w * h;
+                // Seats are compact, filled dots. Thin square/rounded-square outlines
+                // and solid rectangular UI controls are not seats even when colored.
+                // Reject both sparse outlines and almost completely filled boxes.
+                if (pixels < Math.Max(8, (int)(boxArea * 0.28)) || pixels > boxArea * 0.91) continue;
+                bool available = colorPixels >= Math.Max(4, (int)(boxArea * 0.20));
                 int priority = PriorityColors.Length;
                 if (available)
                 {
@@ -149,6 +183,39 @@ namespace InterparkNativeClicker
                     Diameter = (w + h) / 2f, Available = available, Priority = priority });
             }
             return result;
+        }
+
+        private static bool HasSeatLikeColorComponent(byte[] colored, int width, int height,
+            byte[] seen, int[] queue)
+        {
+            int size = width * height;
+            for (int start = 0; start < size; start++)
+            {
+                if (colored[start] == 0 || seen[start] != 0) continue;
+                int head = 0, tail = 0, minX = width, minY = height, maxX = -1, maxY = -1;
+                queue[tail++] = start; seen[start] = 1;
+                while (head < tail)
+                {
+                    int current = queue[head++], x = current % width, y = current / width;
+                    minX = Math.Min(minX, x); maxX = Math.Max(maxX, x);
+                    minY = Math.Min(minY, y); maxY = Math.Max(maxY, y);
+                    for (int dy = -1; dy <= 1; dy++) for (int dx = -1; dx <= 1; dx++)
+                    {
+                        if (dx == 0 && dy == 0) continue;
+                        int nx = x + dx, ny = y + dy;
+                        if (nx < 0 || ny < 0 || nx >= width || ny >= height) continue;
+                        int ni = ny * width + nx;
+                        if (colored[ni] != 0 && seen[ni] == 0) { seen[ni] = 1; queue[tail++] = ni; }
+                    }
+                }
+                int w = maxX - minX + 1, h = maxY - minY + 1;
+                if (w < 5 || h < 5 || w > 90 || h > 90) continue;
+                double ratio = (double)w / h;
+                int area = w * h;
+                if (ratio >= 0.68 && ratio <= 1.47 && tail >= area * 0.20 && tail <= area * 0.91)
+                    return true;
+            }
+            return false;
         }
 
         public static SeatChoice Choose(List<SeatDot> dots, List<PointF> attempted, int maxSeats)
@@ -206,8 +273,11 @@ namespace InterparkNativeClicker
             }
             if (choices.Count == 0) return null;
             choices.Sort((a, b) => {
-                int c = b.Aisle.CompareTo(a.Aisle); if (c != 0) return c;
-                c = b.RunLength.CompareTo(a.RunLength); if (c != 0) return c;
+                // Prefer a complete group matching the requested seat count. Among
+                // equally sized groups, choose the one nearest the top of the map.
+                int c = b.RunLength.CompareTo(a.RunLength); if (c != 0) return c;
+                c = a.Front.CompareTo(b.Front); if (c != 0) return c;
+                c = b.Aisle.CompareTo(a.Aisle); if (c != 0) return c;
                 c = a.Priority.CompareTo(b.Priority); if (c != 0) return c;
                 return a.Dot.Along.CompareTo(b.Dot.Along);
             });
@@ -228,7 +298,7 @@ namespace InterparkNativeClicker
                     bool aisle = leftGap > spacing * 1.45 || rightGap > spacing * 1.45;
                     SeatDot pick = leftGap >= rightGap ? first : last;
                     choices.Add(new SeatChoice { Dot = pick, Group = group, Priority = group.Min(d => d.Priority),
-                        Front = 0, Aisle = aisle, RunLength = length });
+                        Front = group.Average(d => d.Y), Aisle = aisle, RunLength = length });
                 }
         }
 
@@ -294,6 +364,12 @@ namespace InterparkNativeClicker
         {
             double dx = x1 - x2, dy = y1 - y2; return Math.Sqrt(dx * dx + dy * dy);
         }
+
+        private static double AxisDistance(double a, double b)
+        {
+            double difference = Math.Abs(a - b) % Math.PI;
+            return Math.Min(difference, Math.PI - difference);
+        }
     }
 
     internal static class NativeMouse
@@ -306,7 +382,7 @@ namespace InterparkNativeClicker
         {
             SetCursorPos(x, y);
             mouse_event(MOUSEEVENTF_LEFTDOWN, 0, 0, 0, UIntPtr.Zero);
-            System.Threading.Thread.Sleep(3);
+            System.Threading.Thread.Sleep(1);
             mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0, UIntPtr.Zero);
         }
     }
@@ -329,32 +405,71 @@ namespace InterparkNativeClicker
         [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
         [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hwnd);
         [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr hwnd, int command);
+        [DllImport("user32.dll")] private static extern bool GetWindowRect(IntPtr hwnd, out RECT rect);
+        [DllImport("user32.dll")] private static extern short GetAsyncKeyState(int virtualKey);
         [DllImport("user32.dll")] public static extern bool RegisterHotKey(IntPtr hwnd, int id, uint modifiers, Keys key);
         [DllImport("user32.dll")] public static extern bool UnregisterHotKey(IntPtr hwnd, int id);
 
-        public static bool TryFindCompleteButton(IntPtr hwnd, out Point center)
+        [StructLayout(LayoutKind.Sequential)]
+        private struct RECT { public int Left, Top, Right, Bottom; }
+
+        public static bool TryGetWindowBounds(IntPtr hwnd, out Rectangle bounds)
+        {
+            bounds = Rectangle.Empty;
+            RECT rect;
+            if (hwnd == IntPtr.Zero || !GetWindowRect(hwnd, out rect)) return false;
+            if (rect.Right <= rect.Left || rect.Bottom <= rect.Top) return false;
+            bounds = Rectangle.FromLTRB(rect.Left, rect.Top, rect.Right, rect.Bottom);
+            return true;
+        }
+
+        public static bool IsLeftMouseButtonDown()
+        {
+            return (GetAsyncKeyState((int)Keys.LButton) & 0x8000) != 0;
+        }
+
+        public static bool TryFindCompleteButton(IntPtr hwnd, out Point center, bool requireEnabled)
         {
             center = Point.Empty;
             try
             {
                 AutomationElement root = AutomationElement.FromHandle(hwnd);
                 if (root == null) return false;
-                var buttons = root.FindAll(TreeScope.Descendants,
-                    new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.Button));
+                var buttonType = new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.Button);
+                string[] exactNames = new[] { "선택 완료", "선택완료" };
+                foreach (string name in exactNames)
+                {
+                    AutomationElement exact = root.FindFirst(TreeScope.Descendants,
+                        new AndCondition(buttonType,
+                            new PropertyCondition(AutomationElement.NameProperty, name)));
+                    if (TryGetCompleteButtonCenter(exact, requireEnabled, out center)) return true;
+                }
+
+                // Fallback for pages that insert line breaks or extra text in the
+                // accessible label. The common exact-name path above is much faster.
+                var buttons = root.FindAll(TreeScope.Descendants, buttonType);
                 foreach (AutomationElement button in buttons)
                 {
-                    var info = button.Current;
-                    string label = (info.Name ?? "").Replace(" ", "").Replace("\r", "").Replace("\n", "");
-                    if (!label.Contains("선택완료") || !info.IsEnabled || info.IsOffscreen) continue;
-                    System.Windows.Rect bounds = info.BoundingRectangle;
-                    if (bounds.IsEmpty || bounds.Width <= 0 || bounds.Height <= 0) continue;
-                    center = new Point((int)Math.Round(bounds.Left + bounds.Width / 2),
-                        (int)Math.Round(bounds.Top + bounds.Height / 2));
-                    return true;
+                    if (TryGetCompleteButtonCenter(button, requireEnabled, out center)) return true;
                 }
             }
             catch { }
             return false;
+        }
+
+        private static bool TryGetCompleteButtonCenter(AutomationElement button,
+            bool requireEnabled, out Point center)
+        {
+            center = Point.Empty;
+            if (button == null) return false;
+            var info = button.Current;
+            string label = (info.Name ?? "").Replace(" ", "").Replace("\r", "").Replace("\n", "");
+            if (!label.Contains("선택완료") || (requireEnabled && !info.IsEnabled) || info.IsOffscreen) return false;
+            System.Windows.Rect bounds = info.BoundingRectangle;
+            if (bounds.IsEmpty || bounds.Width <= 0 || bounds.Height <= 0) return false;
+            center = new Point((int)Math.Round(bounds.Left + bounds.Width / 2),
+                (int)Math.Round(bounds.Top + bounds.Height / 2));
+            return true;
         }
 
         public static List<WindowInfo> BrowserWindows()
@@ -433,16 +548,27 @@ namespace InterparkNativeClicker
         private readonly Button start = new Button();
         private readonly Button stop = new Button();
         private readonly Timer timer = new Timer();
+        private readonly Timer activityTimer = new Timer();
+        private readonly NotifyIcon activityIcon = new NotifyIcon();
         private readonly List<PointF> attempted = new List<PointF>();
         private Rectangle mapRegion;
+        private Point mapRegionWindowOffset;
+        private bool mapRegionFollowsWindow;
+        private IntPtr mapRegionWindow = IntPtr.Zero;
         private IntPtr targetWindow = IntPtr.Zero;
+        private Point completeButtonWindowOffset;
+        private bool completeButtonCached = false;
         private int maxSeats = 4, clickedSeats = 0;
         private bool running = false;
+        private bool manualMapDrag = false;
+        private bool activityPulse = false;
+        private int scansUntilDirectionRefresh = 0;
+        private int browserForegroundFrames = 0;
         private const int HOTKEY_ID = 7184, WM_HOTKEY = 0x0312;
 
         public MainForm()
         {
-            Text = "포도알 네이티브 클릭 도우미"; Width = 560; Height = 350; MinimumSize = new Size(560, 350);
+            Text = "포도알 네이티브 클릭 도우미 · 최신 수정판 7"; Width = 560; Height = 350; MinimumSize = new Size(560, 350);
             StartPosition = FormStartPosition.CenterScreen; Font = new Font("Segoe UI", 9F);
             var heading = new Label { Left = 18, Top = 16, Width = 510, Height = 26, Text = "좌석 화면에서 빈 좌석을 찾아 실제 마우스로 선택합니다.", Font = new Font("Segoe UI", 11, FontStyle.Bold) };
             Controls.Add(heading);
@@ -461,8 +587,19 @@ namespace InterparkNativeClicker
             stop.Left = 212; stop.Top = 190; stop.Width = 120; stop.Height = 42; stop.Text = "중지 (F8)"; stop.Click += (s,e) => StopRun("사용자가 중지했습니다."); Controls.Add(stop);
             status.Left = 18; status.Top = 248; status.Width = 510; status.Height = 52; status.Text = "먼저 좌석도만 포함하도록 범위를 지정하세요. 실행 중 F8을 누르면 즉시 멈춥니다."; Controls.Add(status);
             timer.Interval = 1; timer.Tick += (s,e) => ScanAndClick();
+            activityIcon.Icon = SystemIcons.Information;
+            activityIcon.Text = "포도알 클릭 도우미 - 대기 중";
+            activityIcon.Visible = false;
+            activityTimer.Interval = 500;
+            activityTimer.Tick += (s,e) => {
+                activityPulse = !activityPulse;
+                activityIcon.Icon = activityPulse ? SystemIcons.Information : SystemIcons.Application;
+            };
             LoadWindows();
-            FormClosing += (s,e) => { timer.Stop(); NativeWindows.UnregisterHotKey(Handle, HOTKEY_ID); };
+            FormClosing += (s,e) => {
+                timer.Stop(); activityTimer.Stop(); activityIcon.Visible = false; activityIcon.Dispose();
+                NativeWindows.UnregisterHotKey(Handle, HOTKEY_ID);
+            };
         }
 
         protected override void OnHandleCreated(EventArgs e)
@@ -496,6 +633,14 @@ namespace InterparkNativeClicker
                 if (picker.ShowDialog() == DialogResult.OK)
                 {
                     mapRegion = picker.SelectedRegion;
+                    WindowInfo selected = browser.SelectedItem as WindowInfo;
+                    Rectangle windowBounds = Rectangle.Empty;
+                    mapRegionFollowsWindow = selected != null &&
+                        NativeWindows.TryGetWindowBounds(selected.Handle, out windowBounds);
+                    mapRegionWindow = mapRegionFollowsWindow ? selected.Handle : IntPtr.Zero;
+                    if (mapRegionFollowsWindow)
+                        mapRegionWindowOffset = new Point(mapRegion.Left - windowBounds.Left,
+                            mapRegion.Top - windowBounds.Top);
                     SeatDetector.ResetNumberAxis();
                     regionLabel.Text = String.Format("{0} × {1} px", mapRegion.Width, mapRegion.Height);
                     status.Text = "좌석도와 가장자리의 열 번호를 범위에 포함하세요.";
@@ -506,9 +651,26 @@ namespace InterparkNativeClicker
 
         private Bitmap CaptureRegionBitmap()
         {
-            var bitmap = new Bitmap(mapRegion.Width, mapRegion.Height, PixelFormat.Format24bppRgb);
-            using (Graphics g = Graphics.FromImage(bitmap)) g.CopyFromScreen(mapRegion.Location, Point.Empty, mapRegion.Size, CopyPixelOperation.SourceCopy);
+            Rectangle captureRegion = CurrentMapRegion();
+            var bitmap = new Bitmap(captureRegion.Width, captureRegion.Height, PixelFormat.Format24bppRgb);
+            using (Graphics g = Graphics.FromImage(bitmap)) g.CopyFromScreen(captureRegion.Location, Point.Empty, captureRegion.Size, CopyPixelOperation.SourceCopy);
             return bitmap;
+        }
+
+        private Rectangle CurrentMapRegion()
+        {
+            IntPtr hwnd = running ? targetWindow : IntPtr.Zero;
+            if (hwnd == IntPtr.Zero)
+            {
+                WindowInfo selected = browser.SelectedItem as WindowInfo;
+                if (selected != null) hwnd = selected.Handle;
+            }
+            Rectangle windowBounds;
+            if (mapRegionFollowsWindow && hwnd == mapRegionWindow &&
+                NativeWindows.TryGetWindowBounds(hwnd, out windowBounds))
+                return new Rectangle(windowBounds.Left + mapRegionWindowOffset.X,
+                    windowBounds.Top + mapRegionWindowOffset.Y, mapRegion.Width, mapRegion.Height);
+            return mapRegion;
         }
 
         private void PreviewCandidates()
@@ -516,10 +678,9 @@ namespace InterparkNativeClicker
             if (mapRegion.Width <= 0 || mapRegion.Height <= 0) { MessageBox.Show("먼저 좌석도 범위를 지정하세요."); return; }
             try
             {
-                SeatDetector.ResetNumberAxis();
                 using (Bitmap bitmap = CaptureRegionBitmap())
                 {
-                    List<SeatDot> dots = SeatDetector.Scan(bitmap);
+                    List<SeatDot> dots = SeatDetector.Scan(bitmap, true, false);
                     int available = dots.Count(d => d.Available);
                     status.Text = SeatDetector.NumberAxisAngle.HasValue
                         ? String.Format("열 번호 방향 인식 · 점 {0}개 · 색 좌석 후보 {1}개", dots.Count, available)
@@ -534,8 +695,15 @@ namespace InterparkNativeClicker
             if (mapRegion.Width <= 0 || mapRegion.Height <= 0) { MessageBox.Show("먼저 좌석도 범위를 지정하세요."); return; }
             WindowInfo selected = browser.SelectedItem as WindowInfo;
             if (selected == null) { MessageBox.Show("Chrome 또는 Edge 창을 선택하세요."); return; }
-            SeatDetector.ResetNumberAxis();
+            if (mapRegionFollowsWindow && selected.Handle != mapRegionWindow)
+            {
+                MessageBox.Show("범위를 지정할 때 선택한 브라우저 창과 현재 창이 다릅니다. 좌석도 범위를 다시 지정하세요.");
+                return;
+            }
             maxSeats = Int32.Parse(seatCount.SelectedItem.ToString()); clickedSeats = 0; attempted.Clear();
+            manualMapDrag = false;
+            scansUntilDirectionRefresh = 0;
+            browserForegroundFrames = 0;
             targetWindow = selected.Handle;
             // Do not restore a maximized Chrome window: SW_RESTORE would shrink it.
             if (NativeWindows.IsIconic(targetWindow)) NativeWindows.ShowWindow(targetWindow, 9);
@@ -545,34 +713,84 @@ namespace InterparkNativeClicker
             {
                 MessageBox.Show("브라우저 창을 앞으로 가져오지 못했습니다. 브라우저를 직접 활성화한 뒤 다시 시작하세요."); return;
             }
-            running = true; Hide(); timer.Start();
+            CacheCompleteButton();
+            running = true;
+            status.Text = "좌석을 찾고 있습니다... 실행 중 F8을 누르면 즉시 멈춥니다.";
+            activityIcon.Text = "● 좌석 검색 중 - F8로 중지";
+            activityIcon.Visible = true;
+            activityTimer.Start();
+            WindowState = FormWindowState.Minimized;
+            NativeWindows.SetForegroundWindow(targetWindow);
+            timer.Start();
         }
 
         private void ScanAndClick()
         {
             if (!running) return;
-            if (NativeWindows.GetForegroundWindow() != targetWindow) { StopRun("브라우저 포커스가 바뀌어 중지했습니다."); return; }
+            // Never inspect the screen while this program is restored over the seat
+            // map. Its colored controls could otherwise be mistaken for seat dots.
+            if (WindowState != FormWindowState.Minimized)
+            {
+                browserForegroundFrames = 0;
+                return;
+            }
+            // Minimizing this window, opening the taskbar, or a browser redraw can
+            // briefly change the foreground window. Pause safely and resume when the
+            // selected browser is active again instead of stopping the whole run.
+            if (NativeWindows.GetForegroundWindow() != targetWindow)
+            {
+                browserForegroundFrames = 0;
+                return;
+            }
+            // Wait for two consecutive browser frames so a restore/minimize animation
+            // can never leak this program's window into the captured seat region.
+            if (++browserForegroundFrames < 2) return;
+            // Do not scan or click halfway through a manual map drag. The first frame
+            // after release will detect the new section and its new seat direction.
+            if (NativeWindows.IsLeftMouseButtonDown())
+            {
+                if (!manualMapDrag)
+                {
+                    SeatDetector.ResetNumberAxis();
+                    scansUntilDirectionRefresh = 0;
+                }
+                manualMapDrag = true;
+                return;
+            }
+            manualMapDrag = false;
             try
             {
                 using (Bitmap bitmap = CaptureRegionBitmap())
                 {
-                    List<SeatDot> dots = SeatDetector.Scan(bitmap);
-                    if (!SeatDetector.NumberAxisAngle.HasValue) { StopRun("좌석 열 번호를 찾지 못했습니다. 좌석도 양끝 숫자가 범위에 포함되는지 확인하세요."); return; }
+                    bool refreshDirection = !SeatDetector.NumberAxisAngle.HasValue ||
+                        scansUntilDirectionRefresh <= 0;
+                    List<SeatDot> dots = SeatDetector.Scan(bitmap, refreshDirection, true);
+                    scansUntilDirectionRefresh = refreshDirection ? 12 : scansUntilDirectionRefresh - 1;
+                    // The map can briefly contain no labels while it is being dragged,
+                    // switched to another section, or redrawn. Keep watching instead
+                    // of treating that transient frame as a fatal error.
+                    if (!SeatDetector.NumberAxisAngle.HasValue) return;
+                    // When a direction change is first observed, wait for the next
+                    // frame before clicking. This avoids using a one-frame redraw.
+                    if (SeatDetector.NumberAxisChanged) return;
                     SeatChoice choice = SeatDetector.Choose(dots, attempted, maxSeats - clickedSeats);
                     if (choice == null) return;
                     foreach (SeatDot dot in choice.Group)
                     {
-                        int x = mapRegion.Left + (int)Math.Round(dot.X);
-                        int y = mapRegion.Top + (int)Math.Round(dot.Y);
+                        Rectangle clickRegion = CurrentMapRegion();
+                        int x = clickRegion.Left + (int)Math.Round(dot.X);
+                        int y = clickRegion.Top + (int)Math.Round(dot.Y);
                         NativeMouse.Click(x, y);
                         attempted.Add(new PointF(dot.X, dot.Y));
                         clickedSeats++;
                     }
                     timer.Stop(); running = false;
                     bool completed = ClickCompleteButton();
+                    System.Media.SystemSounds.Asterisk.Play();
                     StopRun(completed
                         ? String.Format("{0}석을 선택하고 ‘선택 완료’를 눌렀습니다. 다음 화면을 확인하세요.", clickedSeats)
-                        : String.Format("{0}석을 선택했습니다. ‘선택 완료’ 버튼을 찾지 못해 직접 눌러주세요.", clickedSeats));
+                        : String.Format("{0}석을 선택했습니다. ‘선택 완료’ 버튼을 찾지 못해 직접 눌러주세요.", clickedSeats),
+                        false);
                 }
             }
             catch (Exception ex) { StopRun("오류로 중지했습니다: " + ex.Message); }
@@ -580,25 +798,51 @@ namespace InterparkNativeClicker
 
         private bool ClickCompleteButton()
         {
-            for (int attempt = 0; attempt < 8; attempt++)
+            Rectangle windowBounds;
+            if (completeButtonCached && NativeWindows.TryGetWindowBounds(targetWindow, out windowBounds))
+            {
+                NativeMouse.Click(windowBounds.Left + completeButtonWindowOffset.X,
+                    windowBounds.Top + completeButtonWindowOffset.Y);
+                return true;
+            }
+
+            for (int attempt = 0; attempt < 5; attempt++)
             {
                 if (NativeWindows.GetForegroundWindow() != targetWindow) return false;
                 Point center;
-                if (NativeWindows.TryFindCompleteButton(targetWindow, out center))
+                if (NativeWindows.TryFindCompleteButton(targetWindow, out center, true))
                 {
                     NativeMouse.Click(center.X, center.Y);
                     return true;
                 }
-                System.Threading.Thread.Sleep(25);
+                System.Threading.Thread.Sleep(5);
             }
             return false;
         }
 
-        private void StopRun(string message)
+        private void CacheCompleteButton()
         {
-            timer.Stop(); running = false;
-            if (Visible == false) { Show(); Activate(); }
+            completeButtonCached = false;
+            Point center;
+            Rectangle windowBounds;
+            if (!NativeWindows.TryFindCompleteButton(targetWindow, out center, false) ||
+                !NativeWindows.TryGetWindowBounds(targetWindow, out windowBounds)) return;
+            completeButtonWindowOffset = new Point(center.X - windowBounds.Left,
+                center.Y - windowBounds.Top);
+            completeButtonCached = true;
+        }
+
+        private void StopRun(string message, bool restoreWindow = true)
+        {
+            timer.Stop(); activityTimer.Stop(); running = false;
+            activityIcon.Visible = false;
             status.Text = message;
+            if (restoreWindow)
+            {
+                if (Visible == false) Show();
+                if (WindowState == FormWindowState.Minimized) WindowState = FormWindowState.Normal;
+                Activate();
+            }
         }
     }
 }
